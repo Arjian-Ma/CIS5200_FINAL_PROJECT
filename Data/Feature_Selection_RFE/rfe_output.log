@@ -1,0 +1,204 @@
+================================================================================
+RECURSIVE FEATURE ELIMINATION WITH GRADIENT BOOSTING
+================================================================================
+
+Loading base feature data...
+✓ Loaded base data: (128684, 268)
+
+Loading spatial features...
+✓ Loaded spatial data: (128684, 102)
+✓ Found 4 spatial feature columns:
+    - CentroidDist
+    - MinInterTeamDist
+    - FrontlineOverlap
+    - RadialVelocityDiff
+
+Merging spatial features with base data...
+✓ Merged data: (128684, 272)
+
+✓ Total data shape: (128684, 272)
+
+Combining position features (x_position, y_position → position_magnitude)...
+  ✓ Created 10 combined position features
+  ✓ Dropped 20 individual x/y position columns
+
+Removing 3 specific features:
+  - Total_Gold_Difference_Last_Time_Frame
+  - Total_Xp_Difference
+  - Total_Xp_Difference_Last_Time_Frame
+✓ Cleaned data: (128684, 259)
+✓ Total features: 255
+
+Splitting data (80/20 train/test)...
+✓ Train: (102947, 255), Test: (25737, 255)
+
+================================================================================
+STARTING RECURSIVE FEATURE ELIMINATION
+================================================================================
+
+RFE Configuration:
+  Initial features: 255
+  Drop percentage per iteration: 15%
+  Minimum features to keep: 20
+  XGBoost estimators: 50
+  Training samples: 102,947
+  Test samples: 25,737
+
+--------------------------------------------------------------------------------
+Iter   Features   Train RMSE      Test RMSE       Test R²      Action              
+--------------------------------------------------------------------------------
+1      255        953.35          1026.50         0.9376       ✓ New best          
+2      217        956.81          1028.93         0.9373                           
+3      185        952.04          1023.71         0.9380       ✓ New best          
+4      158        954.68          1027.75         0.9375                           
+5      135        954.18          1026.34         0.9377                           
+6      115        954.32          1024.49         0.9379                           
+7      98         953.62          1027.18         0.9376                           
+8      84         956.49          1028.89         0.9373                           
+9      72         955.60          1026.36         0.9377                           
+10     62         956.45          1031.06         0.9371                           
+11     53         962.10          1030.80         0.9371                           
+12     46         964.22          1031.37         0.9370                           
+13     40         966.30          1032.01         0.9370                           
+14     34         969.76          1035.75         0.9365                           
+15     29         969.40          1034.73         0.9366                           
+16     25         973.93          1033.94         0.9367                           
+17     22         975.07          1034.58         0.9367                           
+--------------------------------------------------------------------------------
+
+✓ RFE Complete!
+  Best iteration: 3
+  Best test RMSE: 1023.71
+  Best feature count: 185
+
+================================================================================
+TRAINING FINAL MODEL WITH BEST FEATURES
+================================================================================
+
+Training final model with 185 features...
+✓ Final model trained!
+
+Extracting feature importance from best model...
+✓ Extracted importance for 185 features
+
+Aggregating player-specific features...
+✓ Aggregated into 48 unique feature groups
+
+============================================================
+TOP 30 FEATURE GROUPS (Aggregated)
+============================================================
+Rank   Feature                                       Importance   %        Cumul %   
+------------------------------------------------------------------------------------------
+1      Total_Kill_Difference                         0.658221     65.82    65.82     
+2      Buildings_Taken_Difference                    0.171028     17.10    82.92     
+3      Total_Damage_Done_Diff                        0.080217     8.02     90.95     
+4      Total_Minions_Killed_Difference               0.022171     2.22     93.16     
+5      Total_Assist_Difference                       0.020319     2.03     95.20     
+6      Attack_Damage                                 0.009559     0.96     96.15     
+7      Ability_Power                                 0.007895     0.79     96.94     
+8      Health_Percentage                             0.004397     0.44     97.38     
+9      Armor                                         0.002931     0.29     97.67     
+10     Attack_Speed                                  0.002790     0.28     97.95     
+11     Y_Position                                    0.002640     0.26     98.22     
+12     Power_Regen                                   0.002607     0.26     98.48     
+13     Magic_Resist                                  0.002368     0.24     98.71     
+14     Total_Jungle_Minions_Killed_Difference        0.001279     0.13     98.84     
+15     Magic_Pen                                     0.001229     0.12     98.96     
+16     Health_Regen                                  0.001153     0.12     99.08     
+17     Armor_Pen_Percent                             0.001141     0.11     99.19     
+18     Magic_Pen_Percent                             0.000908     0.09     99.29     
+19     True_Damage_Done_Diff                         0.000772     0.08     99.36     
+20     Total_Ward_Killed_Difference                  0.000753     0.08     99.44     
+21     Magic_Damage_Taken_Diff                       0.000598     0.06     99.50     
+22     Life_Steal                                    0.000540     0.05     99.55     
+23     True_Damage_Done_To_Champions_Diff            0.000425     0.04     99.59     
+24     True_Damage_Taken_Diff                        0.000421     0.04     99.64     
+25     Physical_Damage_Done_To_Champions_Diff        0.000401     0.04     99.68     
+26     Time_Enemy_Spent_Controlled_Difference        0.000390     0.04     99.72     
+27     Movement_Speed                                0.000371     0.04     99.75     
+28     Total_Damage_Done_To_Champions_Diff           0.000357     0.04     99.79     
+29     Total_Ward_Placed_Difference                  0.000356     0.04     99.82     
+30     Physical_Damage_Taken_Diff                    0.000331     0.03     99.86     
+
+✓ Saved full ranking to: results/feature_importance_aggregated.csv
+
+Top 50 features saved to: results/feature_importance_top50.csv
+
+Creating visualizations...
+✓ Saved RFE analysis to: results/rfe_analysis.png
+✓ Saved RFE history to: results/rfe_history.csv
+✓ Saved visualization to: results/feature_importance_gradient_boosting.png
+
+Analyzing feature categories...
+
+============================================================
+FEATURE IMPORTANCE BY CATEGORY
+============================================================
+Category             Importance      Percentage
+--------------------------------------------------
+Other                0.7672          76.72     %
+Objectives           0.1712          17.12     %
+Stats                0.0326          3.26      %
+Farm                 0.0234          2.34      %
+Spatial              0.0027          0.27      %
+Combat               0.0017          0.17      %
+Vision               0.0011          0.11      %
+
+✓ Saved category analysis to: results/feature_importance_by_category.png
+
+================================================================================
+FINAL MODEL PERFORMANCE (WITH BEST FEATURES)
+================================================================================
+
+Final Model (185 features, 100 estimators):
+  Train RMSE: 799.76
+  Test RMSE:  910.24
+
+  Train MAE:  542.02
+  Test MAE:   595.03
+
+  Train R²:   0.9621
+  Test R²:    0.9510
+
+Improvement from initial to best:
+  Initial features: 255
+  Best features: 185
+  Feature reduction: 70 (27.5%)
+  RMSE improvement: 2.79
+
+✓ Saved best features list to: results/best_features_rfe.csv
+
+============================================================
+SPATIAL FEATURES ANALYSIS
+============================================================
+
+Found 4 spatial feature groups
+Total spatial importance: 0.0001
+Spatial contribution: 0.01%
+
+Top 15 Spatial Features:
+Rank   Feature                                            Importance   %       
+--------------------------------------------------------------------------------
+#37    CentroidDist                                       0.000024     0.00    
+#38    MinInterTeamDist                                   0.000016     0.00    
+#39    FrontlineOverlap                                   0.000011     0.00    
+#40    RadialVelocityDiff                                 0.000004     0.00    
+
+✓ Saved spatial feature analysis to: results/spatial_feature_importance.csv
+
+================================================================================
+RECURSIVE FEATURE ELIMINATION COMPLETE
+================================================================================
+
+Generated files:
+  1. results/rfe_analysis.png - RFE progress visualization
+  2. results/rfe_history.csv - Full RFE iteration history
+  3. results/best_features_rfe.csv - List of best features selected
+  4. results/feature_importance_aggregated.csv - Full feature ranking
+  5. results/feature_importance_top50.csv - Top 50 features
+  6. results/feature_importance_gradient_boosting.png - Feature importance plots
+  7. results/feature_importance_by_category.png - Category breakdown
+  8. results/spatial_feature_importance.csv - Spatial features analysis
+
+✨ Best model uses 185 features with test RMSE of 1023.71
+✨ This represents a 27.5% reduction in features!
