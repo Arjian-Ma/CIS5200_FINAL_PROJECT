@@ -32,7 +32,7 @@ def calculate_spatial_features(df):
     for idx, row in tqdm(df.iterrows(), total=len(df), desc="Calculating spatial features", unit="frame"):
         try:
             # Extract positions for both teams
-            # Team A (Blue): Players 1-5
+            # Team A (Blue): Players 1-5 - CONSISTENT with build_xy_dataframe.py (team=1, Riot's team ID 100)
             team_a_positions = []
             for i in range(1, 6):
                 x_col = f'Player{i}_X_Position'
@@ -42,7 +42,7 @@ def calculate_spatial_features(df):
                     if not pd.isna(x) and not pd.isna(y):
                         team_a_positions.append([x, y])
             
-            # Team B (Red): Players 6-10
+            # Team B (Red): Players 6-10 - CONSISTENT with build_xy_dataframe.py (team=-1, Riot's team ID 200)
             team_b_positions = []
             for i in range(6, 11):
                 x_col = f'Player{i}_X_Position'
@@ -144,7 +144,7 @@ def create_featured_dataframe(input_csv_path, output_csv_path=None):
     if input_csv_path.lower().endswith('.parquet'):
         df = pd.read_parquet(input_csv_path)
     else:
-    df = pd.read_csv(input_csv_path)
+        df = pd.read_csv(input_csv_path)
     
     print(f"Original shape: {df.shape}")
     print(f"Total rows: {len(df)}")
@@ -163,6 +163,31 @@ def create_featured_dataframe(input_csv_path, output_csv_path=None):
         
         # Calculate team differences (team 1 minus team -1)
         # For each metric, sum(value * team) gives the difference
+        # 
+        # CONSISTENCY CHECK:
+        # - team = 1 for participants 1-5 (Blue team, Riot's team ID 100)
+        # - team = -1 for participants 6-10 (Red team, Riot's team ID 200)
+        # - Formula: (value * team).sum() = Blue_total - Red_total
+        # - Positive difference = Blue ahead, Negative difference = Red ahead
+        # - This aligns with: Blue wins (winningTeam=100) → participants 1-5 have Y_won=1
+        
+        # Extract winning label (same for all frames in a match)
+        # Y_won: 1 if participant's team won, 0 otherwise
+        # Blue team (participants 1-5, team=1) have Y_won=1 when Blue wins
+        # Red team (participants 6-10, team=-1) have Y_won=1 when Red wins
+        # We check if any Blue participant has Y_won=1 to determine if Blue won
+        blue_team_rows = group_df[group_df['team'] == 1]
+        if len(blue_team_rows) > 0:
+            # Check if Blue team won (any Blue participant has Y_won=1)
+            blue_won = blue_team_rows['Y_won'].iloc[0] == 1 if 'Y_won' in blue_team_rows.columns else 0
+            # Winning label: 1 if Blue won, 0 if Red won
+            winning_label = 1 if blue_won else 0
+        else:
+            # Fallback: check if any participant has Y_won=1
+            if 'Y_won' in group_df.columns:
+                winning_label = 1 if group_df['Y_won'].iloc[0] == 1 and group_df['team'].iloc[0] == 1 else 0
+            else:
+                winning_label = 0
         
         # 1. Total_Gold_Difference
         total_gold_diff = (group_df['Y_total_gold'] * group_df['team']).sum()
@@ -300,6 +325,9 @@ def create_featured_dataframe(input_csv_path, output_csv_path=None):
             'match_id': match_id,
             'frame_idx': frame_idx,
             'timestamp': timestamp,
+            # Winning label (1 if Blue team won, 0 if Red team won)
+            # Consistent with team mapping: Blue (participants 1-5, team=1) wins → label=1
+            'Y_won': winning_label,
             # Basic Economy/Progression
             'Total_Gold_Difference': total_gold_diff,
             'Total_Xp_Difference': total_xp_diff,
@@ -363,7 +391,9 @@ def create_featured_dataframe(input_csv_path, output_csv_path=None):
     # Reorder columns for better organization
     column_order = [
         'match_id', 'frame_idx', 'timestamp',
-        # Economy/Progression (columns 4-9)
+        # Winning label (column 4)
+        'Y_won',
+        # Economy/Progression (columns 5-10)
         'Total_Gold_Difference',
         'Total_Xp_Difference',
         'Total_Gold_Difference_Last_Time_Frame',
@@ -444,15 +474,24 @@ def create_featured_dataframe(input_csv_path, output_csv_path=None):
     featured_df = featured_df[column_order]
     
     # Fill NaN values with 0 (especially important for timestamp 0 where some values may be NaN)
-    # Only fill numeric columns, exclude identifier columns
+    # Only fill numeric columns, exclude identifier columns and Y_won (label column)
     print("\nFilling NaN values with 0...")
     identifier_cols = ['match_id', 'frame_idx', 'timestamp']
-    numeric_cols = [col for col in featured_df.columns if col not in identifier_cols]
+    label_cols = ['Y_won'] if 'Y_won' in featured_df.columns else []
+    exclude_cols = identifier_cols + label_cols
+    numeric_cols = [col for col in featured_df.columns if col not in exclude_cols]
     
     nan_counts_before = featured_df[numeric_cols].isna().sum().sum()
     featured_df[numeric_cols] = featured_df[numeric_cols].fillna(0)
     nan_counts_after = featured_df[numeric_cols].isna().sum().sum()
     print(f"  Filled {nan_counts_before} NaN values in numeric columns (remaining: {nan_counts_after})")
+    
+    # Fill NaN in Y_won with 0 (if any exist, though they shouldn't)
+    if 'Y_won' in featured_df.columns:
+        y_won_nan = featured_df['Y_won'].isna().sum()
+        if y_won_nan > 0:
+            print(f"  Warning: {y_won_nan} NaN values in Y_won label column, filling with 0")
+            featured_df['Y_won'] = featured_df['Y_won'].fillna(0).astype(int)
     
     # Check for any remaining NaNs in identifier columns (should be rare)
     id_nan_counts = featured_df[identifier_cols].isna().sum().sum()
@@ -467,6 +506,7 @@ def create_featured_dataframe(input_csv_path, output_csv_path=None):
     
     print(f"\nColumn Groups:")
     print("- Identifiers (3): match_id, frame_idx, timestamp")
+    print("- Winning Label (1): Y_won (1 if Blue team won, 0 if Red team won)")
     print("- Economy/Progression (6): Total_Gold_Difference, Total_Xp_Difference, etc.")
     print("- Damage Profile (12): Magic, Physical, True damage metrics")
     print("- Performance/Scoreline (2): Total_Kill_Difference, Total_Assist_Difference")
@@ -482,8 +522,8 @@ def create_featured_dataframe(input_csv_path, output_csv_path=None):
         if output_csv_path.lower().endswith('.parquet'):
             featured_df.to_parquet(output_csv_path, index=False)
         else:
-        featured_df.to_csv(output_csv_path, index=False)
-        print(f"✅ Successfully saved {len(featured_df)} rows to {output_csv_path}")
+            featured_df.to_csv(output_csv_path, index=False)
+            print(f"✅ Successfully saved {len(featured_df)} rows to {output_csv_path}")
     
     return featured_df
 
@@ -499,8 +539,8 @@ def main():
     print()
     
     try:
-    # Create featured DataFrame
-    featured_df = create_featured_dataframe(input_file, output_file)
+        # Create featured DataFrame
+        featured_df = create_featured_dataframe(input_file, output_file)
     except FileNotFoundError as e:
         print(f"❌ Error: Input file not found: {input_file}")
         print("Please make sure you have run the build_xy_dataframe.py script first to create xy_rows.csv")

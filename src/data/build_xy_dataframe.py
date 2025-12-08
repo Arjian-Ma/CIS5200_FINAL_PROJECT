@@ -284,30 +284,100 @@ def rows_from_timeline(tl: Dict[str, Any], match_id: str,
 
     return rows
 
-def build_xy_dataframe(timeline_dir: str, compute_f: bool = False) -> pd.DataFrame:
+def build_xy_dataframe(timeline_dir: str, compute_f: bool = False, 
+                       chunk_size: int = 1000, output_path: str = None) -> pd.DataFrame:
     """
     Walk a directory of *_timeline.json files and build the unified XY DataFrame.
+    Processes in chunks to avoid memory issues with large datasets.
+    
+    Args:
+        timeline_dir: Directory containing timeline JSON files
+        compute_f: Whether to compute Xf_this_frame via apply_f
+        chunk_size: Number of files to process before writing a chunk (default: 1000)
+        output_path: If provided, write incrementally to this path instead of returning DataFrame
     """
     paths = sorted(glob.glob(os.path.join(timeline_dir, "*_timeline.json")))
-    all_rows: List[Dict[str, Any]] = []
-
+    
     if not paths:
         print(f"No timeline files found in {timeline_dir}")
         return pd.DataFrame()
 
     print(f"Found {len(paths)} timeline files to process")
     
-    # Add progress bar for processing timeline files
-    for p in tqdm(paths, desc="Processing timeline files", unit="file"):
-        match_id = os.path.basename(p).replace("_timeline.json", "")
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                tl = json.load(f)
-            rows = rows_from_timeline(tl, match_id, compute_f=compute_f)
-            all_rows.extend(rows)
-        except Exception as e:
-            print(f"[WARN] Failed to parse {p}: {e}")
-
+    # Core columns that should always exist
+    core_cols = [
+        "timestamp", "match_id", "frame_idx", "puuid", "team",
+        "X_team", "X_current_gold", "X_minions_killed", "X_jungle_minions_killed",
+        "X_time_enemy_spent_controlled", "X_pos_x", "X_pos_y",
+        "Y_current_gold", "Y_total_gold", "Y_total_xp", "Y_total_kills", "Y_won",
+    ]
+    
+    # If writing incrementally, use temporary parquet files
+    temp_files = []
+    all_rows: List[Dict[str, Any]] = []
+    total_rows = 0
+    
+    # Process files in chunks
+    for chunk_start in tqdm(range(0, len(paths), chunk_size), desc="Processing chunks", unit="chunk"):
+        chunk_paths = paths[chunk_start:chunk_start + chunk_size]
+        chunk_rows: List[Dict[str, Any]] = []
+        
+        for p in chunk_paths:
+            match_id = os.path.basename(p).replace("_timeline.json", "")
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    tl = json.load(f)
+                rows = rows_from_timeline(tl, match_id, compute_f=compute_f)
+                chunk_rows.extend(rows)
+            except Exception as e:
+                print(f"[WARN] Failed to parse {p}: {e}")
+        
+        if not chunk_rows:
+            continue
+        
+        # Create DataFrame for this chunk
+        chunk_df = pd.DataFrame(chunk_rows)
+        
+        # Ensure core columns exist
+        for c in core_cols:
+            if c not in chunk_df.columns:
+                chunk_df[c] = np.nan
+        
+        # If compute_f=False, drop the placeholder column if present
+        if "Xf_this_frame" in chunk_df.columns and not compute_f:
+            chunk_df = chunk_df.drop(columns=["Xf_this_frame"])
+        
+        # If writing incrementally, save chunk to temp file
+        if output_path:
+            temp_file = f"{output_path}.temp_{chunk_start}.parquet"
+            chunk_df.to_parquet(temp_file, index=False)
+            temp_files.append(temp_file)
+            total_rows += len(chunk_df)
+            print(f"  Saved chunk {len(temp_files)}: {len(chunk_df):,} rows (total: {total_rows:,})")
+        else:
+            # Accumulate in memory (for smaller datasets)
+            all_rows.extend(chunk_rows)
+    
+    # If writing incrementally, combine temp files
+    if output_path and temp_files:
+        print(f"\nCombining {len(temp_files)} chunks into final file...")
+        dfs = []
+        for temp_file in tqdm(temp_files, desc="Loading chunks", unit="chunk"):
+            dfs.append(pd.read_parquet(temp_file))
+            os.remove(temp_file)  # Clean up temp file
+        
+        df = pd.concat(dfs, ignore_index=True)
+        
+        # Sort and deduplicate
+        df = df.sort_values(["match_id", "frame_idx", "participantId"]).reset_index(drop=True)
+        df = df.drop_duplicates(subset=["match_id", "frame_idx", "participantId"], keep="last")
+        
+        # Save final file
+        df.to_parquet(output_path, index=False)
+        print(f"✅ Saved {len(df):,} rows to {output_path}")
+        return df
+    
+    # Otherwise, build DataFrame from accumulated rows
     if not all_rows:
         print("No rows extracted from timeline files")
         return pd.DataFrame()
@@ -317,13 +387,7 @@ def build_xy_dataframe(timeline_dir: str, compute_f: bool = False) -> pd.DataFra
 
     df = pd.DataFrame(all_rows)
 
-    # Ensure core columns exist even if some timelines lacked data
-    core_cols = [
-        "timestamp", "match_id", "frame_idx", "puuid", "team",
-        "X_team", "X_current_gold", "X_minions_killed", "X_jungle_minions_killed",
-        "X_time_enemy_spent_controlled", "X_pos_x", "X_pos_y",
-        "Y_current_gold", "Y_total_gold", "Y_total_xp", "Y_total_kills", "Y_won",
-    ]
+    # Ensure core columns exist
     for c in core_cols:
         if c not in df.columns:
             df[c] = np.nan
@@ -346,36 +410,41 @@ def build_xy_dataframe(timeline_dir: str, compute_f: bool = False) -> pd.DataFra
 
 def main():
     ap = argparse.ArgumentParser(description="Build LoL XY dataframe from timeline JSONs.")
-    ap.add_argument("--timeline_dir", type=str, default="data/raw/timeline_data", help="Directory with *_timeline.json files.")
+    ap.add_argument("--timeline_dir", type=str, default="timeline_data", help="Directory with *_timeline.json files.")
     ap.add_argument("--out", type=str, default="data/raw/xy_rows.parquet", help="Output path (.csv or .parquet). Defaults to Parquet format.")
     ap.add_argument("--compute_f", action="store_true", help="Compute Xf_this_frame via apply_f (stub).")
+    ap.add_argument("--chunk_size", type=int, default=1000, help="Number of files to process per chunk (default: 1000). Lower for less memory usage.")
     args = ap.parse_args()
 
-    df = build_xy_dataframe(args.timeline_dir, compute_f=args.compute_f)
-
-    if df.empty:
-        print(f"No timeline files found in {args.timeline_dir} or no rows parsed.")
-        return
-
-    # Save with progress indication
+    # Ensure output is parquet for chunked processing
     out = args.out
+    if not out.lower().endswith(".parquet") and not out.lower().endswith(".csv"):
+        out += ".parquet"
+    
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     
-    print(f"Saving {len(df):,} rows to {out}...")
-    
+    # Use chunked processing for large datasets (always use for parquet)
     if out.lower().endswith(".parquet"):
-        df.to_parquet(out, index=False)
-    elif out.lower().endswith(".csv"):
-        df.to_csv(out, index=False)
+        print(f"Using chunked processing (chunk_size={args.chunk_size}) to avoid memory issues...")
+        df = build_xy_dataframe(args.timeline_dir, compute_f=args.compute_f, 
+                                chunk_size=args.chunk_size, output_path=out)
     else:
-        # default to Parquet for better performance
-        if "." not in os.path.basename(out):
-            out += ".parquet"
-        df.to_parquet(out, index=False)
+        # For CSV, still use chunked processing but write at the end
+        print(f"Using chunked processing (chunk_size={args.chunk_size}) to avoid memory issues...")
+        df = build_xy_dataframe(args.timeline_dir, compute_f=args.compute_f, 
+                                chunk_size=args.chunk_size)
+        
+        if df.empty:
+            print(f"No timeline files found in {args.timeline_dir} or no rows parsed.")
+            return
+        
+        print(f"Saving {len(df):,} rows to {out}...")
+        df.to_csv(out, index=False)
+        print(f"✅ Successfully saved {len(df):,} rows -> {out}")
 
-    print(f"✅ Successfully saved {len(df):,} rows -> {out}")
-    print(f"DataFrame shape: {df.shape}")
-    print(f"Columns: {len(df.columns)}")
+    if not df.empty:
+        print(f"DataFrame shape: {df.shape}")
+        print(f"Columns: {len(df.columns)}")
 
 if __name__ == "__main__":
     main()

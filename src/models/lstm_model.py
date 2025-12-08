@@ -428,7 +428,8 @@ def train_lstm(
     hidden_size=128, num_layers=2, dropout=0.4,
     model_save_dir=None, checkpoint_name="lstm_model.pth",
     best_checkpoint_name="lstm_model_best.pth", curve_save_path=None,
-    feature_scaler=None  # Scaler for saving in checkpoint
+    feature_scaler=None,  # Scaler for saving in checkpoint
+    forecast_horizon=1  # Forecast horizon for autoregressive mode
 ):
     """
     Simple training function for LSTM model with early stopping and best model saving
@@ -453,12 +454,16 @@ def train_lstm(
         curve_save_path: Path to save training curves plot
     """
     # Create model with customizable architecture
+    # For autoregressive mode, output_size = forecast_horizon
+    output_size = forecast_horizon
     model = LSTM(
         input_size=input_size,
         hidden_size=hidden_size,
         num_layers=num_layers,
-        dropout=dropout
+        dropout=dropout,
+        output_size=output_size  # Change from 1 to forecast_horizon
     )
+    print(f"✓ Model created: output_size={output_size} (forecast_horizon={forecast_horizon})")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     
@@ -502,7 +507,21 @@ def train_lstm(
             lengths = batch['lengths'].to(device)
             
             optimizer.zero_grad()
-            outputs = model(sequences, lengths)
+            outputs = model(sequences, lengths)  # Shape: (batch_size, forecast_horizon)
+            
+            # Handle targets: dataloader now creates multi-step targets for autoregressive mode
+            actual_batch_size = outputs.shape[0]
+            if forecast_horizon > 1:
+                # Check target shape
+                if len(targets.shape) == 1:
+                    # Targets are flat (batch_size * forecast_horizon), reshape
+                    targets = targets.view(actual_batch_size, forecast_horizon)
+                elif targets.shape[1] == 1:
+                    # Single target per sample, expand to match forecast_horizon
+                    # (fallback for non-autoregressive dataloader)
+                    targets = targets.repeat(1, forecast_horizon)
+            
+            # Compute loss
             loss = criterion(outputs, targets)
             
             # Check for NaN loss
@@ -527,7 +546,15 @@ def train_lstm(
                 targets = batch['targets'].to(device)
                 lengths = batch['lengths'].to(device)
                 
-                outputs = model(sequences, lengths)
+                outputs = model(sequences, lengths)  # Shape: (batch_size, forecast_horizon)
+                
+                # Handle targets: reshape if needed
+                if forecast_horizon > 1:
+                    if len(targets.shape) == 1:
+                        targets = targets.view(len(targets) // forecast_horizon, forecast_horizon)
+                    elif targets.shape[1] == 1:
+                        targets = targets.repeat(1, forecast_horizon)
+                
                 loss = criterion(outputs, targets)
                 val_loss += loss.item()
         
@@ -539,7 +566,15 @@ def train_lstm(
                 targets = batch['targets'].to(device)
                 lengths = batch['lengths'].to(device)
                 
-                outputs = model(sequences, lengths)
+                outputs = model(sequences, lengths)  # Shape: (batch_size, forecast_horizon)
+                
+                # Handle targets: reshape if needed
+                if forecast_horizon > 1:
+                    if len(targets.shape) == 1:
+                        targets = targets.view(len(targets) // forecast_horizon, forecast_horizon)
+                    elif targets.shape[1] == 1:
+                        targets = targets.repeat(1, forecast_horizon)
+                
                 loss = criterion(outputs, targets)
                 test_loss += loss.item()
         
@@ -597,6 +632,8 @@ def train_lstm(
                 'input_size': input_size,
                 'epoch': epoch + 1,
                 'best_val_loss': best_val_loss,
+                'forecast_horizon': forecast_horizon,
+                'output_size': output_size,
             }
             if feature_list is not None:
                 checkpoint['feature_list'] = feature_list
@@ -654,6 +691,8 @@ def train_lstm(
         'input_size': input_size,
         'best_val_loss': best_val_loss,
         'best_epoch': best_epoch,
+        'forecast_horizon': forecast_horizon,
+        'output_size': output_size,
     }
     
     # Save feature list if provided (for consistent testing)
@@ -725,7 +764,7 @@ def load_lstm_model(model_path="models/lstm_model.pth"):
     
     return model, checkpoint
 
-def prepare_data_loaders(feature_list=None, batch_size=32, sequence_length=15):
+def prepare_data_loaders(feature_list=None, batch_size=32, sequence_length=15, forecast_horizon=1, autoregressive=True):
     """
     Combined function: Select features and create data loaders in one step
     
@@ -737,6 +776,8 @@ def prepare_data_loaders(feature_list=None, batch_size=32, sequence_length=15):
             - 'specified': Use hardcoded specified features
         batch_size: Batch size for data loaders
         sequence_length: Sequence length for LSTM
+        forecast_horizon: Number of future steps to predict (for autoregressive mode)
+        autoregressive: If True, add Y history as features and create multi-step targets
         
     Returns:
         Tuple of (train_loader, val_loader, test_loader, input_size, feature_cols)
@@ -790,6 +831,14 @@ def prepare_data_loaders(feature_list=None, batch_size=32, sequence_length=15):
         feature_cols = [col for col in train_data.columns if col not in exclude_cols]
         print(f"✓ Auto-detected {len(feature_cols)} features from train.parquet")
     
+    # For autoregressive mode: Add Y history as features
+    # Note: We already have Total_Gold_Difference_Last_Time_Frame, but we'll add full history
+    if autoregressive and forecast_horizon > 1:
+        print(f"\n🔄 Autoregressive mode: Adding Y history to features for forecast_horizon={forecast_horizon}")
+        # The Y history will be added in the dataloader by concatenating it to features
+        # For now, we keep the same feature_cols, but mark that we need autoregressive mode
+        print(f"   Y history will be included in input sequences")
+    
     print(f"Y targets: {y_targets}")
     print(f"First 10 features: {feature_cols[:10]}")
     
@@ -804,7 +853,9 @@ def prepare_data_loaders(feature_list=None, batch_size=32, sequence_length=15):
         sequence_length=sequence_length,
         target_cols=y_targets,
         feature_cols=feature_cols,
-        remove_leakage=False
+        remove_leakage=False,
+        forecast_horizon=forecast_horizon if autoregressive else 1,
+        autoregressive=autoregressive
     )
     
     # Get input size from first batch
@@ -966,7 +1017,9 @@ def main(
     model_save_dir=None,
     checkpoint_name="lstm_model.pth",
     best_checkpoint_name="lstm_model_best.pth",
-    curve_save_path=None
+    curve_save_path=None,
+    forecast_horizon=5,  # Forecast horizon for autoregressive mode
+    autoregressive=True  # Enable autoregressive mode
 ):
     """
     Main function to train LSTM model
@@ -996,7 +1049,11 @@ def main(
     try:
         # Select features and create data loaders (combined function)
         train_loader, val_loader, test_loader, input_size, feature_cols = prepare_data_loaders(
-            feature_list, batch_size=batch_size, sequence_length=sequence_length
+            feature_list, 
+            batch_size=batch_size, 
+            sequence_length=sequence_length,
+            forecast_horizon=forecast_horizon,
+            autoregressive=autoregressive
         )
         
         if feature_cols is None or len(feature_cols) == 0:
@@ -1009,6 +1066,7 @@ def main(
         
         # Train model
         print("\nStarting training...")
+        print(f"🔄 Autoregressive mode: forecast_horizon={forecast_horizon}")
         model, train_losses, val_losses, test_losses = train_lstm(
             train_loader=train_loader,
             val_loader=val_loader,
@@ -1027,7 +1085,8 @@ def main(
             checkpoint_name=checkpoint_name,
             best_checkpoint_name=best_checkpoint_name,
             curve_save_path=curve_save_path,
-            feature_scaler=feature_scaler  # Pass scaler to save in checkpoint
+            feature_scaler=feature_scaler,  # Pass scaler to save in checkpoint
+            forecast_horizon=forecast_horizon  # Pass forecast horizon
         )
         
         # Calculate final RMSE
@@ -1047,6 +1106,8 @@ def main(
         print(f"  - Model parameters: {sum(p.numel() for p in model.parameters()):,}")
         print(f"  - Input features: {input_size}")
         print(f"  - Target: Total_Gold_Difference")
+        print(f"  - Forecast horizon: {forecast_horizon}")
+        print(f"  - Autoregressive mode: {autoregressive}")
         print(f"  - Sequence length: {sequence_length}")
         print(f"  - Batch size: {batch_size}")
         print(f"  - Hidden size: {hidden_size}")
@@ -1118,6 +1179,14 @@ Examples:
     parser.add_argument('--dropout', type=float, default=0.4,
                        help='Dropout rate (default: 0.4)')
     
+    # Autoregressive parameters
+    parser.add_argument('--forecast_horizon', type=int, default=5,
+                       help='Forecast horizon for autoregressive mode (default: 5)')
+    parser.add_argument('--autoregressive', action='store_true', default=True,
+                       help='Enable autoregressive mode (default: True)')
+    parser.add_argument('--no_autoregressive', dest='autoregressive', action='store_false',
+                       help='Disable autoregressive mode')
+    
     # Save paths
     parser.add_argument('--model_save_dir', type=str, default=None,
                        help='Directory to save models (default: models/)')
@@ -1156,5 +1225,7 @@ Examples:
         model_save_dir=args.model_save_dir,
         checkpoint_name=args.checkpoint_name,
         best_checkpoint_name=args.best_checkpoint_name,
-        curve_save_path=args.curve_save_path
+        curve_save_path=args.curve_save_path,
+        forecast_horizon=args.forecast_horizon,
+        autoregressive=args.autoregressive
     )

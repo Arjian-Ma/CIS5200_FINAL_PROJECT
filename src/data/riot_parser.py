@@ -88,7 +88,7 @@ class RiotTimelineParser:
     
     def __init__(self, api_key: str, routing: str = "americas", 
                  matches_per_player: int = 20, output_dir: str = "data/raw/timeline_data",
-                 delay_between_requests: float = 0.1):
+                 delay_between_requests: float = 0.1, start_offset: int = 0):
         """
         Initialize the Riot Timeline Parser
         
@@ -98,12 +98,15 @@ class RiotTimelineParser:
             matches_per_player: Number of recent matches to fetch per player
             output_dir: Directory to store timeline data
             delay_between_requests: Delay between API requests to respect rate limits
+            start_offset: Number of most recent matches to skip before fetching
+                          (e.g., start_offset=200 means skip first 200, then fetch matches_per_player)
         """
         self.api_key = api_key
         self.routing = routing
         self.matches_per_player = matches_per_player
-        self.output_dir = output_dir
+        self.output_dir = os.path.abspath(output_dir)
         self.delay_between_requests = delay_between_requests
+        self.start_offset = start_offset
         
         # Initialize rate limiter
         self.rate_limiter = RateLimiter(requests_per_second=20, requests_per_2min=100)
@@ -112,7 +115,7 @@ class RiotTimelineParser:
         self.headers = {"X-Riot-Token": api_key}
         
         # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
         
         # Statistics tracking
         self.stats = {
@@ -134,6 +137,8 @@ class RiotTimelineParser:
         self._load_existing_matches()
         
         logger.info(f"Initialized RiotTimelineParser with {matches_per_player} matches per player")
+        if self.start_offset > 0:
+            logger.info(f"Skipping first {self.start_offset} most recent matches per player")
         logger.info(f"Found {len(self.processed_match_ids)} existing matches in output directory")
     
     def is_match_processed(self, match_id: str) -> bool:
@@ -156,6 +161,14 @@ class RiotTimelineParser:
             match_id: Match ID to mark as processed
         """
         self.processed_match_ids.add(match_id)
+
+    def _match_file_exists(self, match_id: str) -> bool:
+        """
+        Check whether a timeline file is already present on disk for the match ID.
+        """
+        filename = f"{match_id}_timeline.json"
+        filepath = os.path.join(self.output_dir, filename)
+        return os.path.exists(filepath)
     
     def get_unique_matches(self, match_ids: List[str]) -> List[str]:
         """
@@ -169,11 +182,14 @@ class RiotTimelineParser:
         """
         unique_matches = []
         for match_id in match_ids:
-            if not self.is_match_processed(match_id):
-                unique_matches.append(match_id)
-            else:
+            if self.is_match_processed(match_id) or self._match_file_exists(match_id):
+                if not self.is_match_processed(match_id):
+                    # Ensure in-memory cache stays in sync with disk contents
+                    self.processed_match_ids.add(match_id)
                 self.stats['matches_skipped_duplicates'] += 1
-                logger.debug(f"Skipping duplicate match: {match_id}")
+                logger.debug(f"Skipping duplicate match (already scraped): {match_id}")
+                continue
+            unique_matches.append(match_id)
         
         return unique_matches
     
@@ -195,9 +211,10 @@ class RiotTimelineParser:
             return
         
         for filename in os.listdir(self.output_dir):
-            if filename.endswith('_timeline.json'):
-                match_id = filename.replace('_timeline.json', '')
-                self.processed_match_ids.add(match_id)
+            if not filename.endswith('_timeline.json'):
+                continue
+            match_id = filename.replace('_timeline.json', '')
+            self.processed_match_ids.add(match_id)
     
     def get_puuid_by_riot_id(self, game_name: str, tag_line: str) -> Optional[str]:
         """
@@ -238,7 +255,7 @@ class RiotTimelineParser:
             logger.error(f"Request error for {game_name}#{tag_line}: {e}")
             return None
     
-    def get_match_ids(self, puuid: str, count: int = None, queue: int = None) -> List[str]:
+    def get_match_ids(self, puuid: str, count: int = None, queue: int = None, start_offset: int = None) -> List[str]:
         """
         Get recent match IDs for a player
         
@@ -246,15 +263,18 @@ class RiotTimelineParser:
             puuid: Player's PUUID
             count: Number of matches to fetch (defaults to self.matches_per_player)
             queue: Queue ID to filter matches (e.g., 420 for ranked solo, 440 for ranked flex)
+            start_offset: Number of most recent matches to skip (defaults to self.start_offset)
             
         Returns:
             List of match IDs
         """
         if count is None:
             count = self.matches_per_player
+        if start_offset is None:
+            start_offset = self.start_offset
             
         url = f"{self.base_url}/lol/match/v5/matches/by-puuid/{puuid}/ids"
-        params = {"start": 0, "count": count}
+        params = {"start": start_offset, "count": count}
         
         # Add queue filter if specified
         if queue is not None:
@@ -275,9 +295,16 @@ class RiotTimelineParser:
                 logger.warning(f"Rate limited for PUUID {puuid}, waiting...")
                 # Wait longer for rate limit reset
                 time.sleep(5)
-                return self.get_match_ids(puuid, count, queue)  # Retry
+                return self.get_match_ids(puuid, count, queue, start_offset)  # Retry
             else:
-                logger.error(f"Error getting match IDs for PUUID {puuid}: {response.status_code}")
+                error_msg = f"Error getting match IDs for PUUID {puuid}: {response.status_code}"
+                try:
+                    error_body = response.json()
+                    if isinstance(error_body, dict) and "status" in error_body:
+                        error_msg += f" - {error_body.get('status', {}).get('message', 'Unknown error')}"
+                    logger.error(error_msg)
+                except:
+                    logger.error(f"{error_msg} - Response: {response.text[:200]}")
                 return []
                 
         except requests.exceptions.RequestException as e:
@@ -583,9 +610,10 @@ def main():
     
     # Initialize parser
     parser = RiotTimelineParser(
-        api_key="RGAPI-d98465b1-c804-471c-9fa3-c2e52b8d78aa",
+        api_key="RGAPI-e0bdd094-90f0-40c7-992a-34de4a8d0978",
         routing="americas",
-        matches_per_player=30,  # Start with fewer matches for testing
+        matches_per_player=100,  # Number of matches to fetch per player
+        start_offset=200,  # Skip first 200 most recent matches, then fetch 100
         output_dir="timeline_data"
         # Rate limiting is now handled automatically by the RateLimiter class
     )

@@ -59,10 +59,16 @@ print(f"✓ Checkpoint loaded")
 
 # Detect model type if auto
 if args.model_type == 'auto':
-    if 'forecast_horizon' in checkpoint or 'scaler_dict' in checkpoint:
+    # Check for LSTM model first (has input_size)
+    if 'input_size' in checkpoint:
+        # Check if it's autoregressive LSTM
+        if checkpoint.get('forecast_horizon', 1) > 1 or checkpoint.get('output_size', 1) > 1:
+            args.model_type = 'lstm'  # Still use 'lstm' type, but will detect autoregressive in prediction
+        else:
+            args.model_type = 'lstm'
+    # Check for hierarchical autoregressive model (has scaler_dict)
+    elif 'scaler_dict' in checkpoint:
         args.model_type = 'autoregressive'
-    elif 'input_size' in checkpoint:
-        args.model_type = 'lstm'
     else:
         raise ValueError(f"Could not auto-detect model type from checkpoint. Keys: {list(checkpoint.keys())}")
 
@@ -70,25 +76,30 @@ print(f"✓ Model type: {args.model_type}")
 
 # Get feature list for LSTM
 if args.model_type == 'lstm':
-    if args.feature_list is None:
-        if 'feature_list' in checkpoint:
-            feature_cols = checkpoint['feature_list']
-            print(f"✓ Using feature list from checkpoint ({len(feature_cols)} features)")
-        else:
-            feature_cols = get_specified_features()
-            print(f"✓ Using specified features from LSTM model ({len(feature_cols)} features)")
+    # Priority: Always use checkpoint feature_list if available (to match scaler)
+    if 'feature_list' in checkpoint:
+        feature_cols = checkpoint['feature_list']
+        print(f"✓ Using feature list from checkpoint ({len(feature_cols)} features)")
+        if args.feature_list is not None and args.feature_list != 'specified':
+            print(f"  ⚠ Note: Overriding with checkpoint features to match scaler (expected {len(feature_cols)} features)")
+    elif args.feature_list is None:
+        # Fallback: use get_specified_features() if no checkpoint feature list
+        feature_cols = get_specified_features()
+        print(f"✓ Using specified features from LSTM model ({len(feature_cols)} features)")
     elif args.feature_list == 'specified':
         feature_cols = get_specified_features()
         print(f"✓ Using specified features ({len(feature_cols)} features)")
     elif args.feature_list.endswith('.csv'):
         feature_df = pd.read_csv(args.feature_list)
         if 'feature' in feature_df.columns:
-            feature_cols = feature_df['feature'].tolist()
+            feature_col = 'feature'
         elif 'Feature' in feature_df.columns:
-            feature_cols = feature_df['Feature'].tolist()
+            feature_col = 'Feature'
         else:
-            feature_cols = feature_df.iloc[:, 0].tolist()
-        print(f"✓ Loaded {len(feature_cols)} features from {args.feature_list}")
+            feature_col = feature_df.columns[0]
+        feature_cols = feature_df[feature_col].dropna().tolist()
+        print(f"✓ Loaded {len(feature_cols)} features from CSV: {args.feature_list}")
+        print(f"  Features in order: {feature_cols[:5]}..." if len(feature_cols) > 5 else f"  Features: {feature_cols}")
     else:
         feature_cols = [f.strip() for f in args.feature_list.split(',')]
         print(f"✓ Using provided feature list ({len(feature_cols)} features)")
@@ -130,16 +141,28 @@ if args.model_type == 'lstm':
     num_layers = checkpoint.get('num_layers', 2)
     dropout = checkpoint.get('dropout', 0.4)
     
+    # Check if model is autoregressive
+    lstm_forecast_horizon = checkpoint.get('forecast_horizon', 1)
+    lstm_output_size = checkpoint.get('output_size', 1)
+    is_lstm_autoregressive = lstm_forecast_horizon > 1 or lstm_output_size > 1
+    
+    if is_lstm_autoregressive:
+        output_size = lstm_output_size if lstm_output_size > 1 else lstm_forecast_horizon
+        print(f"🔄 Detected LSTM autoregressive mode: forecast_horizon={lstm_forecast_horizon}, output_size={output_size}")
+    else:
+        output_size = 1
+        print(f"✓ LSTM many-to-one mode: output_size={output_size}")
+    
     model = LSTM(
         input_size=input_size,
         hidden_size=hidden_size,
         num_layers=num_layers,
         dropout=dropout,
-        output_size=1
+        output_size=output_size
     )
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
-    
+
     # Load feature scaler if available
     if 'feature_scaler' in checkpoint:
         import pickle
@@ -151,7 +174,7 @@ if args.model_type == 'lstm':
         print(f"⚠ Warning: No feature scaler found in checkpoint. Features will not be scaled!")
         print(f"   This may cause incorrect predictions if model was trained with scaled features.")
     
-    print(f"✓ LSTM model loaded: input_size={input_size}, hidden_size={hidden_size}, layers={num_layers}")
+    print(f"✓ LSTM model loaded: input_size={input_size}, hidden_size={hidden_size}, layers={num_layers}, output_size={output_size}")
     
 elif args.model_type == 'autoregressive':
     # Load autoregressive model
@@ -178,7 +201,20 @@ model.eval()
 # Select test games
 print(f"\nSelecting {args.num_games} test games...")
 test_match_frame_counts = test_df.groupby('match_id').size()
-min_frames = forecast_horizon + args.sequence_length if args.model_type == 'autoregressive' else args.sequence_length + 5
+
+# Determine minimum frames needed based on model type
+if args.model_type == 'autoregressive':
+    min_frames = forecast_horizon + args.sequence_length
+elif args.model_type == 'lstm':
+    # Check if LSTM is autoregressive
+    lstm_forecast_horizon = checkpoint.get('forecast_horizon', 1)
+    if lstm_forecast_horizon > 1:
+        min_frames = args.sequence_length + lstm_forecast_horizon
+    else:
+        min_frames = args.sequence_length + 5
+else:
+    min_frames = args.sequence_length + 5
+
 good_test_matches = test_match_frame_counts[test_match_frame_counts >= min_frames].index
 
 np.random.seed(300)
@@ -196,71 +232,159 @@ for match_idx, match_id in enumerate(selected_matches):
     total_frames = len(game_data)
     
     if args.model_type == 'lstm':
-        # LSTM: Create sliding window predictions
-        predictions_list = []
-        actuals_list = []
-        frames_list = []
+        # Check if LSTM is autoregressive
+        is_lstm_autoregressive = checkpoint.get('forecast_horizon', 1) > 1 or checkpoint.get('output_size', 1) > 1
+        lstm_forecast_horizon = checkpoint.get('forecast_horizon', 1)
         
-        for start_idx in range(total_frames - args.sequence_length + 1):
-            end_idx = start_idx + args.sequence_length
-            sequence_data = game_data.iloc[start_idx:end_idx]
+        if is_lstm_autoregressive:
+            # LSTM Autoregressive mode: Use cutoff approach
+            if total_frames < args.sequence_length + lstm_forecast_horizon:
+                print(f"  Skipping - too short (need at least {args.sequence_length + lstm_forecast_horizon} frames)")
+                continue
             
-            # Extract features
-            feature_values = sequence_data[feature_cols].values
+            forecast_horizon_actual = lstm_forecast_horizon
+            cutoff_frame = total_frames - forecast_horizon_actual
+            
+            if cutoff_frame < args.sequence_length:
+                print(f"  Skipping - invalid forecast horizon")
+                continue
+            
+            input_data = game_data.iloc[:cutoff_frame].copy()
+            target_data = game_data.iloc[cutoff_frame:].copy()
+            
+            # Use last sequence_length frames from known history
+            start_idx = max(0, cutoff_frame - args.sequence_length)
+            sequence_data = game_data.iloc[start_idx:cutoff_frame].copy()
+            
+            # Extract X features and add Y history for autoregressive mode
+            X_features = sequence_data[feature_cols].values
+            y_history = sequence_data[args.target_col].values.reshape(-1, 1)
+            feature_values = np.concatenate([X_features, y_history], axis=1)
             
             # Check for NaN
             if np.isnan(feature_values).any():
                 feature_values = np.nan_to_num(feature_values, nan=0.0)
             
-            # Apply feature scaling if scaler is available (IMPORTANT: model was trained on scaled features!)
+            # Apply feature scaling
             if feature_scaler is not None:
-                # Reshape for scaling: (seq_len, features) -> (seq_len * features,)
                 original_shape = feature_values.shape
                 reshaped = feature_values.reshape(-1, feature_values.shape[-1])
                 scaled = feature_scaler.transform(reshaped)
                 feature_values = scaled.reshape(original_shape)
             
+            # Ensure exactly sequence_length frames
+            if len(feature_values) < args.sequence_length:
+                padding_needed = args.sequence_length - len(feature_values)
+                first_frame = feature_values[0:1].repeat(padding_needed, axis=0)
+                feature_values = np.vstack([first_frame, feature_values])
+            elif len(feature_values) > args.sequence_length:
+                feature_values = feature_values[-args.sequence_length:]
+            
             # Convert to tensor
             sequence_tensor = torch.FloatTensor(feature_values).unsqueeze(0)
             length_tensor = torch.LongTensor([args.sequence_length])
             
-            # Predict
+            # Predict (output shape: (1, forecast_horizon))
             with torch.no_grad():
-                pred = model(sequence_tensor, length_tensor).squeeze().item()
+                predictions_raw = model(sequence_tensor, length_tensor)
+                predictions_array = predictions_raw.squeeze().cpu().numpy()
             
-            # Get actual value (last frame of sequence)
-            actual = sequence_data[args.target_col].iloc[-1]
-            frame_idx = sequence_data['frame_idx'].iloc[-1]
+            # Handle forecast_horizon vs actual available future frames
+            if len(predictions_array) > forecast_horizon_actual:
+                predictions_array = predictions_array[:forecast_horizon_actual]
+            elif len(predictions_array) < forecast_horizon_actual:
+                last_pred = predictions_array[-1] if len(predictions_array) > 0 else 0
+                predictions_array = np.pad(predictions_array, (0, forecast_horizon_actual - len(predictions_array)), 
+                                           constant_values=last_pred)
             
-            predictions_list.append(pred)
-            actuals_list.append(actual)
-            frames_list.append(frame_idx)
-        
-        if len(predictions_list) == 0:
+            # Get actual values for future frames
+            actuals = target_data[args.target_col].values[:forecast_horizon_actual]
+            frames = target_data['frame_idx'].values[:forecast_horizon_actual]
+            
+            # Calculate metrics
+            min_len = min(len(actuals), len(predictions_array))
+            rmse = np.sqrt(np.mean((actuals[:min_len] - predictions_array[:min_len]) ** 2))
+            mae = np.mean(np.abs(actuals[:min_len] - predictions_array[:min_len]))
+            
+            # Store results
+            all_game_results.append({
+                'match_id': match_id,
+                'real_full': game_data[args.target_col].values,
+                'frames_full': game_data['frame_idx'].values,
+                'cutoff_frame': cutoff_frame,
+                'predicted_last': predictions_array,
+                'real_last': actuals,
+                'frames_last': frames,
+                'rmse': rmse,
+                'mae': mae,
+                'model_type': 'lstm_autoregressive'
+            })
+        else:
+            # LSTM Many-to-One mode: Create sliding window predictions
+            predictions_list = []
+            actuals_list = []
+            frames_list = []
+            
+            for start_idx in range(total_frames - args.sequence_length + 1):
+                end_idx = start_idx + args.sequence_length
+                sequence_data = game_data.iloc[start_idx:end_idx]
+                
+                # Extract features
+                feature_values = sequence_data[feature_cols].values
+                
+                # Check for NaN
+                if np.isnan(feature_values).any():
+                    feature_values = np.nan_to_num(feature_values, nan=0.0)
+                
+                # Apply feature scaling if scaler is available (IMPORTANT: model was trained on scaled features!)
+                if feature_scaler is not None:
+                    # Reshape for scaling: (seq_len, features) -> (seq_len * features,)
+                    original_shape = feature_values.shape
+                    reshaped = feature_values.reshape(-1, feature_values.shape[-1])
+                    scaled = feature_scaler.transform(reshaped)
+                    feature_values = scaled.reshape(original_shape)
+                
+                # Convert to tensor
+                sequence_tensor = torch.FloatTensor(feature_values).unsqueeze(0)
+                length_tensor = torch.LongTensor([args.sequence_length])
+                
+                # Predict
+                with torch.no_grad():
+                    pred = model(sequence_tensor, length_tensor).squeeze().item()
+                
+                # Get actual value (last frame of sequence)
+                actual = sequence_data[args.target_col].iloc[-1]
+                frame_idx = sequence_data['frame_idx'].iloc[-1]
+                
+                predictions_list.append(pred)
+                actuals_list.append(actual)
+                frames_list.append(frame_idx)
+            
+            if len(predictions_list) == 0:
         print(f"  Skipping - too short")
         continue
     
-        predictions = np.array(predictions_list)
-        actuals = np.array(actuals_list)
-        frames = np.array(frames_list)
-        
-        # Calculate metrics
-        rmse = np.sqrt(np.mean((actuals - predictions) ** 2))
-        mae = np.mean(np.abs(actuals - predictions))
-        
-        # Store results
-        all_game_results.append({
-            'match_id': match_id,
-            'real_full': game_data[args.target_col].values,
-            'frames_full': game_data['frame_idx'].values,
-            'cutoff_frame': None,
-            'predicted': predictions,
-            'actuals': actuals,
-            'frames': frames,
-            'rmse': rmse,
-            'mae': mae,
-            'model_type': 'lstm'
-        })
+            predictions = np.array(predictions_list)
+            actuals = np.array(actuals_list)
+            frames = np.array(frames_list)
+            
+            # Calculate metrics
+            rmse = np.sqrt(np.mean((actuals - predictions) ** 2))
+            mae = np.mean(np.abs(actuals - predictions))
+            
+            # Store results
+            all_game_results.append({
+                'match_id': match_id,
+                'real_full': game_data[args.target_col].values,
+                'frames_full': game_data['frame_idx'].values,
+                'cutoff_frame': None,
+                'predicted': predictions,
+                'actuals': actuals,
+                'frames': frames,
+                'rmse': rmse,
+                'mae': mae,
+                'model_type': 'lstm'
+            })
         
     elif args.model_type == 'autoregressive':
         # Autoregressive: Predict last forecast_horizon frames
@@ -366,7 +490,7 @@ for idx, game in enumerate(all_game_results):
     ax = plt.subplot(rows, cols, idx + 1)
     
     if game['model_type'] == 'lstm':
-        # LSTM visualization: show sliding window predictions
+        # LSTM many-to-one visualization: show sliding window predictions
         frames_full = game['frames_full']
         real_full = game['real_full']
         frames_pred = game['frames']
@@ -385,8 +509,17 @@ for idx, game in enumerate(all_game_results):
         ax.plot(frames_pred, actuals, 'g*', 
                label='Actual (at pred)', markersize=6, alpha=0.9, zorder=5)
         
-    elif game['model_type'] == 'autoregressive':
-        # Autoregressive visualization: show endgame forecasting
+        ax.axhline(y=0, color='k', linestyle=':', linewidth=1, alpha=0.5)
+        ax.set_xlabel('Frame', fontsize=8)
+        ax.set_ylabel('Gold Diff', fontsize=8)
+        match_display = game['match_id'][:12] + '...' if len(game['match_id']) > 12 else game['match_id']
+        ax.set_title(f'G{idx+1}: RMSE={game["rmse"]:.0f}', fontsize=9, fontweight='bold')
+        ax.legend(fontsize=5, loc='best')
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(labelsize=7)
+    
+    elif game['model_type'] == 'lstm_autoregressive':
+        # LSTM autoregressive visualization: show endgame forecasting
     real_full = game['real_full']
     frames_full = game['frames_full']
     cutoff = game['cutoff_frame']
@@ -394,7 +527,7 @@ for idx, game in enumerate(all_game_results):
     real_last = game['real_last']
     frames_last = game['frames_last']
     
-        # Plot full real trajectory
+        # Plot known history
     ax.plot(frames_full[:cutoff], real_full[:cutoff], 'b-', 
            label='Known History', linewidth=2, marker='o', markersize=3, alpha=0.6)
     
@@ -414,11 +547,48 @@ for idx, game in enumerate(all_game_results):
         ax.axvspan(frames_last[0], frames_last[-1], alpha=0.15, color='yellow')
     
     ax.axhline(y=0, color='k', linestyle=':', linewidth=1, alpha=0.5)
+        ax.set_xlabel('Frame', fontsize=8)
+        ax.set_ylabel('Gold Diff', fontsize=8)
+        match_display = game['match_id'][:12] + '...' if len(game['match_id']) > 12 else game['match_id']
+        ax.set_title(f'G{idx+1}: RMSE={game["rmse"]:.0f}', fontsize=9, fontweight='bold')
+        ax.legend(fontsize=5, loc='best')
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(labelsize=7)
+        
+    elif game['model_type'] == 'autoregressive':
+        # Autoregressive visualization: show endgame forecasting
+        real_full = game['real_full']
+        frames_full = game['frames_full']
+        cutoff = game['cutoff_frame']
+        pred_last = game['predicted_last']
+        real_last = game['real_last']
+        frames_last = game['frames_last']
+        
+        # Plot full real trajectory
+        ax.plot(frames_full[:cutoff], real_full[:cutoff], 'b-', 
+               label='Known History', linewidth=2, marker='o', markersize=3, alpha=0.6)
+        
+        # Plot real endgame (ground truth)
+        ax.plot(frames_last, real_last, 'g-', 
+               label='Real Endgame', linewidth=3, marker='*', markersize=8, alpha=0.9, zorder=5)
+        
+        # Plot predicted endgame
+        ax.plot(frames_last[:len(pred_last)], pred_last, 'r--', 
+               label='Predicted', linewidth=3, marker='D', markersize=6, alpha=0.8, zorder=4)
+        
+        # Vertical line at cutoff
+        ax.axvline(x=frames_full[cutoff-1], color='orange', linestyle=':', linewidth=2, alpha=0.7)
+        
+        # Shade the forecast region
+        if len(frames_last) > 0:
+            ax.axvspan(frames_last[0], frames_last[-1], alpha=0.15, color='yellow')
+        
+        ax.axhline(y=0, color='k', linestyle=':', linewidth=1, alpha=0.5)
     ax.set_xlabel('Frame', fontsize=8)
-    ax.set_ylabel('Gold Diff', fontsize=8)
+        ax.set_ylabel('Gold Diff', fontsize=8)
     
     match_display = game['match_id'][:12] + '...' if len(game['match_id']) > 12 else game['match_id']
-    ax.set_title(f'G{idx+1}: RMSE={game["rmse"]:.0f}', fontsize=9, fontweight='bold')
+        ax.set_title(f'G{idx+1}: RMSE={game["rmse"]:.0f}', fontsize=9, fontweight='bold')
     ax.legend(fontsize=5, loc='best')
     ax.grid(True, alpha=0.3)
     ax.tick_params(labelsize=7)
@@ -426,7 +596,12 @@ for idx, game in enumerate(all_game_results):
 # Determine title
 model_name = os.path.basename(args.model_path).replace('.pth', '').replace('_', ' ').title()
 if args.model_type == 'lstm':
-    title = f'LSTM Model: {num_games} Test Games (Sliding Window Predictions)'
+    # Check if any games are autoregressive
+    has_autoregressive = any(g.get('model_type') == 'lstm_autoregressive' for g in all_game_results)
+    if has_autoregressive:
+        title = f'LSTM Autoregressive Model: {num_games} Test Games (Endgame Forecasting)'
+    else:
+        title = f'LSTM Model: {num_games} Test Games (Sliding Window Predictions)'
 elif args.model_type == 'autoregressive':
     title = f'Endgame Forecasting Model: {num_games} Test Games'
 
@@ -451,12 +626,23 @@ print("TEST GAME SUMMARY")
 print(f"{'='*60}")
 
 if args.model_type == 'lstm':
-    print(f"{'Game':<6} {'Match ID':<25} {'Frames':<8} {'RMSE':>10} {'MAE':>10}")
-    print("-"*60)
-    for idx, game in enumerate(all_game_results):
-        match_display = game['match_id'][:25]
-        total = len(game['real_full'])
-        print(f"{idx+1:<6} {match_display:<25} {total:<8} {game['rmse']:>10.2f} {game['mae']:>10.2f}")
+    # Check if any games are autoregressive
+    has_autoregressive = any(g.get('model_type') == 'lstm_autoregressive' for g in all_game_results)
+    if has_autoregressive:
+        print(f"{'Game':<6} {'Match ID':<25} {'Total':<8} {'Cutoff':<8} {'RMSE':>10} {'MAE':>10}")
+        print("-"*65)
+        for idx, game in enumerate(all_game_results):
+            match_display = game['match_id'][:25]
+            total = len(game['real_full'])
+            cutoff = game.get('cutoff_frame', 0)
+            print(f"{idx+1:<6} {match_display:<25} {total:<8} {cutoff:<8} {game['rmse']:>10.2f} {game['mae']:>10.2f}")
+    else:
+        print(f"{'Game':<6} {'Match ID':<25} {'Frames':<8} {'RMSE':>10} {'MAE':>10}")
+        print("-"*60)
+        for idx, game in enumerate(all_game_results):
+            match_display = game['match_id'][:25]
+            total = len(game['real_full'])
+            print(f"{idx+1:<6} {match_display:<25} {total:<8} {game['rmse']:>10.2f} {game['mae']:>10.2f}")
 elif args.model_type == 'autoregressive':
 print(f"{'Game':<6} {'Match ID':<25} {'Total':<8} {'Cutoff':<8} {'RMSE':>10} {'MAE':>10}")
 print("-"*60)

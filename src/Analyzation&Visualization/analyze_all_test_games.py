@@ -14,6 +14,7 @@ import os
 sys.path.append('src')
 
 from models.lstm_model import LSTM, get_specified_features
+from models.temporal_transformer import TemporalTransformer
 
 print("="*60)
 print("ANALYZING ALL TEST GAMES")
@@ -24,8 +25,8 @@ parser = argparse.ArgumentParser(description='Analyze test games with different 
 parser.add_argument('--model_path', type=str, default='models/lstm_model.pth',
                     help='Path to model checkpoint (default: models/lstm_model.pth)')
 parser.add_argument('--model_type', type=str, default='auto',
-                    choices=['auto', 'lstm', 'autoregressive'],
-                    help='Model type: auto (detect from checkpoint), lstm, or autoregressive')
+                    choices=['auto', 'lstm', 'autoregressive', 'temporal_transformer'],
+                    help='Model type: auto (detect), lstm, temporal_transformer, or autoregressive')
 parser.add_argument('--data_path', type=str, default='data/processed/featured_data_with_scores.parquet',
                     help='Path to featured data (default: data/processed/featured_data_with_scores.parquet)')
 parser.add_argument('--feature_list', type=str, default=None,
@@ -61,11 +62,12 @@ print(f"✓ Checkpoint loaded")
 
 # Detect model type if auto
 if args.model_type == 'auto':
-    # Check checkpoint keys to determine model type
-    if 'forecast_horizon' in checkpoint or 'scaler_dict' in checkpoint:
-        args.model_type = 'autoregressive'
+    if 'd_model' in checkpoint and 'nhead' in checkpoint:
+        args.model_type = 'temporal_transformer'
     elif 'input_size' in checkpoint:
         args.model_type = 'lstm'
+    elif 'scaler_dict' in checkpoint:
+        args.model_type = 'autoregressive'
     else:
         raise ValueError(f"Could not auto-detect model type from checkpoint. Keys: {list(checkpoint.keys())}")
 
@@ -128,17 +130,21 @@ else:
     # Recreate test split from full dataset
     print("Creating test split...")
     unique_matches = df['match_id'].unique()
-    np.random.seed(42)
-    shuffled_matches = np.random.permutation(unique_matches)
-    
-    n_train = int(len(unique_matches) * 0.7)
-    n_val = int(len(unique_matches) * 0.15)
-    
-    test_matches = shuffled_matches[n_train + n_val:]
+np.random.seed(42)
+shuffled_matches = np.random.permutation(unique_matches)
+
+n_train = int(len(unique_matches) * 0.7)
+n_val = int(len(unique_matches) * 0.15)
+
+test_matches = shuffled_matches[n_train + n_val:]
     test_df = df[df['match_id'].isin(test_matches)].copy()
     print(f"✓ Created test split: {len(test_matches)} games")
 
 # Initialize model based on type
+feature_scaler = None
+lstm_forecast_horizon = None
+transformer_forecast_horizon = None
+
 if args.model_type == 'lstm':
     # Load LSTM model
     input_size = checkpoint['input_size']
@@ -146,18 +152,29 @@ if args.model_type == 'lstm':
     num_layers = checkpoint.get('num_layers', 2)
     dropout = checkpoint.get('dropout', 0.4)
     
+    # Check if model is autoregressive
+    lstm_forecast_horizon = checkpoint.get('forecast_horizon', 1)
+    lstm_output_size = checkpoint.get('output_size', 1)
+    is_lstm_autoregressive = lstm_forecast_horizon > 1 or lstm_output_size > 1
+    
+    if is_lstm_autoregressive:
+        output_size = lstm_output_size if lstm_output_size > 1 else lstm_forecast_horizon
+        print(f"🔄 Detected LSTM autoregressive mode: forecast_horizon={lstm_forecast_horizon}, output_size={output_size}")
+    else:
+        output_size = 1
+        print(f"✓ LSTM many-to-one mode: output_size={output_size}")
+    
     model = LSTM(
         input_size=input_size,
         hidden_size=hidden_size,
         num_layers=num_layers,
         dropout=dropout,
-        output_size=1
+        output_size=output_size
     )
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
     # Load feature scaler if available
-    feature_scaler = None
     if 'feature_scaler' in checkpoint:
         import pickle
         import io
@@ -168,8 +185,46 @@ if args.model_type == 'lstm':
         print(f"⚠ Warning: No feature scaler found in checkpoint. Features will not be scaled!")
         print(f"   This may cause incorrect predictions if model was trained with scaled features.")
     
-    print(f"✓ LSTM model loaded: input_size={input_size}, hidden_size={hidden_size}, layers={num_layers}")
+    print(f"✓ LSTM model loaded: input_size={input_size}, hidden_size={hidden_size}, layers={num_layers}, output_size={output_size}")
     
+elif args.model_type == 'temporal_transformer':
+    input_size = checkpoint['input_size']
+    transformer_forecast_horizon = checkpoint.get('forecast_horizon', 1)
+    d_model = checkpoint.get('d_model', 256)
+    nhead = checkpoint.get('nhead', 8)
+    num_layers = checkpoint.get('num_layers', 4)
+    dim_feedforward = checkpoint.get('dim_feedforward', 512)
+    dropout = checkpoint.get('dropout', 0.1)
+
+    model = TemporalTransformer(
+        input_size=input_size,
+        forecast_horizon=transformer_forecast_horizon,
+        d_model=d_model,
+        nhead=nhead,
+        num_layers=num_layers,
+        dim_feedforward=dim_feedforward,
+        dropout=dropout
+    )
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+
+    if 'feature_scaler' in checkpoint:
+        import io
+        import pickle
+
+        scaler_buffer = io.BytesIO(checkpoint['feature_scaler'])
+        feature_scaler = pickle.load(scaler_buffer)
+        print(f"✓ Feature scaler loaded from checkpoint")
+    else:
+        print(f"⚠ Warning: No feature scaler found in checkpoint. Features will not be scaled!")
+        print(f"   This may cause incorrect predictions if model was trained with scaled features.")
+
+    print(
+        f"✓ Temporal Transformer loaded: input_size={input_size}, "
+        f"d_model={d_model}, layers={num_layers}, heads={nhead}, "
+        f"forecast_horizon={transformer_forecast_horizon}"
+    )
+
 elif args.model_type == 'autoregressive':
     # Load autoregressive model
     import importlib.util
@@ -180,16 +235,16 @@ elif args.model_type == 'autoregressive':
     AutoregressiveHierarchicalPredictor = NN_module.AutoregressiveHierarchicalPredictor
     FeatureGroups = NN_module.FeatureGroups
     
-    scaler_dict = checkpoint['scaler_dict']
-    forecast_horizon = checkpoint['forecast_horizon']
-    
-    fg = FeatureGroups()
-    model = AutoregressiveHierarchicalPredictor(fg, hidden_dim=32, lstm_layers=1, forecast_horizon=forecast_horizon)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    
-    target_mean = scaler_dict['target_mean']
-    target_std = scaler_dict['target_std']
+scaler_dict = checkpoint['scaler_dict']
+forecast_horizon = checkpoint['forecast_horizon']
+
+fg = FeatureGroups()
+model = AutoregressiveHierarchicalPredictor(fg, hidden_dim=32, lstm_layers=1, forecast_horizon=forecast_horizon)
+model.load_state_dict(checkpoint['model_state_dict'])
+model.eval()
+
+target_mean = scaler_dict['target_mean']
+target_std = scaler_dict['target_std']
     print(f"✓ Autoregressive model loaded: forecast_horizon={forecast_horizon}")
 
 print(f"\nProcessing all {len(test_matches)} test games...")
@@ -219,10 +274,10 @@ for match_idx, match_id in enumerate(test_matches):
         print(f"  Processed {match_idx + 1}/{len(test_matches)} games...")
     
     try:
-        game_data = test_df[test_df['match_id'] == match_id].copy().sort_values('frame_idx').reset_index(drop=True)
-        
-        total_frames = len(game_data)
-        
+    game_data = test_df[test_df['match_id'] == match_id].copy().sort_values('frame_idx').reset_index(drop=True)
+    
+    total_frames = len(game_data)
+    
         # Double-check length (should already be filtered, but safety check)
         if total_frames < args.min_game_length:
             skipped += 1
@@ -235,130 +290,272 @@ for match_idx, match_id in enumerate(test_matches):
         
         # Predict based on model type
         if args.model_type == 'lstm':
-            # LSTM: Create sequences of length args.sequence_length
-            # Predict the last frame of each sequence
-            predictions_list = []
-            actuals_list = []
+            # Check if LSTM is autoregressive
+            is_lstm_autoregressive = checkpoint.get('forecast_horizon', 1) > 1 or checkpoint.get('output_size', 1) > 1
+            lstm_forecast_horizon = checkpoint.get('forecast_horizon', 1)
             
-            for start_idx in range(total_frames - args.sequence_length + 1):
-                end_idx = start_idx + args.sequence_length
-                sequence_data = game_data.iloc[start_idx:end_idx]
+            if is_lstm_autoregressive:
+                # LSTM Autoregressive mode: Use cutoff approach
+                if total_frames < args.sequence_length + lstm_forecast_horizon:
+                    skipped += 1
+                    continue
                 
-                # Extract features
-                feature_values = sequence_data[feature_cols].values
+                # Evaluate exactly the trained forecast horizon
+                forecast_horizon_actual = lstm_forecast_horizon
+                cutoff_frame = total_frames - forecast_horizon_actual
+
+                if cutoff_frame < args.sequence_length:
+                    skipped += 1
+                    continue
+                
+                target_data = game_data.iloc[cutoff_frame:].copy()
+                
+                # Use last sequence_length frames from known history
+                start_idx = max(0, cutoff_frame - args.sequence_length)
+                sequence_data = game_data.iloc[start_idx:cutoff_frame].copy()
+                
+                # Extract X features and add Y history for autoregressive mode
+                X_features = sequence_data[feature_cols].values
+                y_history = sequence_data[args.target_col].values.reshape(-1, 1)
+                feature_values = np.concatenate([X_features, y_history], axis=1)
                 
                 # Check for NaN
                 if np.isnan(feature_values).any():
                     feature_values = np.nan_to_num(feature_values, nan=0.0)
                 
-                # Apply feature scaling if scaler is available (IMPORTANT: model was trained on scaled features!)
+                # Apply feature scaling
                 if feature_scaler is not None:
-                    # Reshape for scaling: (seq_len, features) -> (seq_len * features,)
                     original_shape = feature_values.shape
                     reshaped = feature_values.reshape(-1, feature_values.shape[-1])
                     scaled = feature_scaler.transform(reshaped)
                     feature_values = scaled.reshape(original_shape)
                 
-                # Convert to tensor: (1, seq_len, features)
+                # Ensure exactly sequence_length frames
+                if len(feature_values) < args.sequence_length:
+                    padding_needed = args.sequence_length - len(feature_values)
+                    first_frame = feature_values[0:1].repeat(padding_needed, axis=0)
+                    feature_values = np.vstack([first_frame, feature_values])
+                elif len(feature_values) > args.sequence_length:
+                    feature_values = feature_values[-args.sequence_length:]
+                
+                # Convert to tensor
                 sequence_tensor = torch.FloatTensor(feature_values).unsqueeze(0)
                 length_tensor = torch.LongTensor([args.sequence_length])
                 
-                # Predict
+                # Predict (output shape: (1, forecast_horizon))
                 with torch.no_grad():
-                    pred = model(sequence_tensor, length_tensor).squeeze().item()
+                    predictions_raw = model(sequence_tensor, length_tensor)
+                    predictions_array = predictions_raw.squeeze().cpu().numpy()
                 
-                # Get actual value (last frame of sequence)
-                actual = sequence_data[args.target_col].iloc[-1]
+                # Handle forecast_horizon vs actual available future frames
+                if len(predictions_array) > forecast_horizon_actual:
+                    predictions_array = predictions_array[:forecast_horizon_actual]
+                elif len(predictions_array) < forecast_horizon_actual:
+                    last_pred = predictions_array[-1] if len(predictions_array) > 0 else 0
+                    predictions_array = np.pad(predictions_array, (0, forecast_horizon_actual - len(predictions_array)), 
+                                               constant_values=last_pred)
                 
-                predictions_list.append(pred)
-                actuals_list.append(actual)
+                # Get actual values for future frames
+                actuals = target_data[args.target_col].values[:forecast_horizon_actual]
+                
+                # Calculate metrics
+                min_len = min(len(actuals), len(predictions_array))
+                rmse = np.sqrt(np.mean((actuals[:min_len] - predictions_array[:min_len]) ** 2))
+                mae = np.mean(np.abs(actuals[:min_len] - predictions_array[:min_len]))
+                
+                all_rmses.append(rmse)
+                all_maes.append(mae)
+            else:
+                # LSTM Many-to-One mode: Create sequences of length args.sequence_length
+                # Predict the last frame of each sequence
+                predictions_list = []
+                actuals_list = []
+                
+                for start_idx in range(total_frames - args.sequence_length + 1):
+                    end_idx = start_idx + args.sequence_length
+                    sequence_data = game_data.iloc[start_idx:end_idx]
+                    
+                    # Extract features
+                    feature_values = sequence_data[feature_cols].values
+                    
+                    # Check for NaN
+                    if np.isnan(feature_values).any():
+                        feature_values = np.nan_to_num(feature_values, nan=0.0)
+                    
+                    # Apply feature scaling if scaler is available (IMPORTANT: model was trained on scaled features!)
+                    if feature_scaler is not None:
+                        # Reshape for scaling: (seq_len, features) -> (seq_len * features,)
+                        original_shape = feature_values.shape
+                        reshaped = feature_values.reshape(-1, feature_values.shape[-1])
+                        scaled = feature_scaler.transform(reshaped)
+                        feature_values = scaled.reshape(original_shape)
+                    
+                    # Convert to tensor: (1, seq_len, features)
+                    sequence_tensor = torch.FloatTensor(feature_values).unsqueeze(0)
+                    length_tensor = torch.LongTensor([args.sequence_length])
+                    
+                    # Predict
+                    with torch.no_grad():
+                        pred = model(sequence_tensor, length_tensor).squeeze().item()
+                    
+                    # Get actual value (last frame of sequence)
+                    actual = sequence_data[args.target_col].iloc[-1]
+                    
+                    predictions_list.append(pred)
+                    actuals_list.append(actual)
+                
+                if len(predictions_list) == 0:
+                    skipped += 1
+                    continue
+                
+                predictions = np.array(predictions_list)
+                actuals = np.array(actuals_list)
+                
+                # Calculate metrics for this game
+                rmse = np.sqrt(np.mean((actuals - predictions) ** 2))
+                mae = np.mean(np.abs(actuals - predictions))
+                
+                all_rmses.append(rmse)
+                all_maes.append(mae)
             
-            if len(predictions_list) == 0:
+        elif args.model_type == 'temporal_transformer':
+            if transformer_forecast_horizon is None:
+                transformer_forecast_horizon = checkpoint.get('forecast_horizon', 1)
+
+            if total_frames < args.sequence_length + transformer_forecast_horizon:
                 skipped += 1
                 continue
-            
-            predictions = np.array(predictions_list)
-            actuals = np.array(actuals_list)
-            
-            # Calculate metrics for this game
-            rmse = np.sqrt(np.mean((actuals - predictions) ** 2))
-            mae = np.mean(np.abs(actuals - predictions))
-            
+
+            forecast_horizon_actual = transformer_forecast_horizon
+            cutoff_frame = total_frames - forecast_horizon_actual
+
+            if cutoff_frame < args.sequence_length:
+        skipped += 1
+        continue
+    
+            target_data = game_data.iloc[cutoff_frame:].copy()
+
+            start_idx = max(0, cutoff_frame - args.sequence_length)
+            sequence_data = game_data.iloc[start_idx:cutoff_frame].copy()
+
+            X_features = sequence_data[feature_cols].values
+            y_history = sequence_data[args.target_col].values.reshape(-1, 1)
+            feature_values = np.concatenate([X_features, y_history], axis=1)
+
+            if np.isnan(feature_values).any():
+                feature_values = np.nan_to_num(feature_values, nan=0.0)
+
+            if feature_scaler is not None:
+                original_shape = feature_values.shape
+                reshaped = feature_values.reshape(-1, feature_values.shape[-1])
+                scaled = feature_scaler.transform(reshaped)
+                feature_values = scaled.reshape(original_shape)
+
+            if len(feature_values) < args.sequence_length:
+                padding_needed = args.sequence_length - len(feature_values)
+                first_frame = feature_values[0:1].repeat(padding_needed, axis=0)
+                feature_values = np.vstack([first_frame, feature_values])
+            elif len(feature_values) > args.sequence_length:
+                feature_values = feature_values[-args.sequence_length:]
+
+            sequence_tensor = torch.FloatTensor(feature_values).unsqueeze(0)
+            length_tensor = torch.LongTensor([args.sequence_length])
+
+            with torch.no_grad():
+                predictions_raw = model(sequence_tensor, length_tensor)
+                predictions_array = predictions_raw.squeeze().cpu().numpy()
+
+            if len(predictions_array) > forecast_horizon_actual:
+                predictions_array = predictions_array[:forecast_horizon_actual]
+            elif len(predictions_array) < forecast_horizon_actual:
+                last_pred = predictions_array[-1] if len(predictions_array) > 0 else 0
+                predictions_array = np.pad(
+                    predictions_array,
+                    (0, forecast_horizon_actual - len(predictions_array)),
+                    constant_values=last_pred
+                )
+
+            actuals = target_data[args.target_col].values[:forecast_horizon_actual]
+
+            min_len = min(len(actuals), len(predictions_array))
+            rmse = np.sqrt(np.mean((actuals[:min_len] - predictions_array[:min_len]) ** 2))
+            mae = np.mean(np.abs(actuals[:min_len] - predictions_array[:min_len]))
+
             all_rmses.append(rmse)
             all_maes.append(mae)
-            
+
         elif args.model_type == 'autoregressive':
             # Autoregressive: Use all frames except last forecast_horizon as input
-            cutoff_frame = total_frames - forecast_horizon
+    cutoff_frame = total_frames - forecast_horizon
             if cutoff_frame < 1:
                 skipped += 1
                 continue
                 
-            input_data = game_data.iloc[:cutoff_frame].copy()
-            target_data = game_data.iloc[cutoff_frame:].copy()
-            
-            # Extract features
-            x1_seq = input_data[fg.damage_features].values
-            x2_seq = input_data[fg.vision_features].values
+    input_data = game_data.iloc[:cutoff_frame].copy()
+    target_data = game_data.iloc[cutoff_frame:].copy()
+    
+    # Extract features
+    x1_seq = input_data[fg.damage_features].values
+    x2_seq = input_data[fg.vision_features].values
             y_history = input_data[args.target_col].values
-            
-            # Normalize
-            def normalize_feature(data, key):
-                mean = scaler_dict.get(f'{key}_mean', 0)
-                std = scaler_dict.get(f'{key}_std', 1)
-                return (data - mean) / std
-            
-            x1_norm = normalize_feature(x1_seq, 'x1')
-            x2_norm = normalize_feature(x2_seq, 'x2')
-            y_hist_norm = normalize_feature(y_history, 'y_history')
-            
-            # Extract player features
-            player_features = {}
-            for p_idx in range(1, 11):
-                player_features[f'p{p_idx}'] = {}
-                
-                for g_key, g_features in [
-                    ('g1', fg.offensive_stats),
-                    ('g2', fg.defensive_stats),
-                    ('g3', fg.vamp_stats),
-                    ('g4', fg.resource_stats),
-                    ('g5', fg.mobility_stats)
-                ]:
-                    cols = [f'Player{p_idx}_{stat}' for stat in g_features]
-                    g_data = input_data[cols].values
-                    g_norm = normalize_feature(g_data, f'p{p_idx}_{g_key}')
-                    player_features[f'p{p_idx}'][g_key] = torch.FloatTensor(g_norm)
-            
-            # Create batch
-            batch_input = {
-                'x1': torch.FloatTensor(x1_norm).unsqueeze(0),
-                'x2': torch.FloatTensor(x2_norm).unsqueeze(0),
-                'y_history': torch.FloatTensor(y_hist_norm).unsqueeze(0),
-                'players': {},
-                'seq_lens': torch.LongTensor([len(input_data)])
-            }
-            
-            for p_key in player_features.keys():
-                batch_input['players'][p_key] = {
-                    g_key: player_features[p_key][g_key].unsqueeze(0)
-                    for g_key in ['g1', 'g2', 'g3', 'g4', 'g5']
-                }
-            
-            # Predict
-            with torch.no_grad():
-                predictions = model(batch_input)
-                predictions_denorm = predictions[0].numpy() * target_std + target_mean
-            
-            # Get real values
+    
+    # Normalize
+    def normalize_feature(data, key):
+        mean = scaler_dict.get(f'{key}_mean', 0)
+        std = scaler_dict.get(f'{key}_std', 1)
+        return (data - mean) / std
+    
+    x1_norm = normalize_feature(x1_seq, 'x1')
+    x2_norm = normalize_feature(x2_seq, 'x2')
+    y_hist_norm = normalize_feature(y_history, 'y_history')
+    
+    # Extract player features
+    player_features = {}
+    for p_idx in range(1, 11):
+        player_features[f'p{p_idx}'] = {}
+        
+        for g_key, g_features in [
+            ('g1', fg.offensive_stats),
+            ('g2', fg.defensive_stats),
+            ('g3', fg.vamp_stats),
+            ('g4', fg.resource_stats),
+            ('g5', fg.mobility_stats)
+        ]:
+            cols = [f'Player{p_idx}_{stat}' for stat in g_features]
+            g_data = input_data[cols].values
+            g_norm = normalize_feature(g_data, f'p{p_idx}_{g_key}')
+            player_features[f'p{p_idx}'][g_key] = torch.FloatTensor(g_norm)
+    
+    # Create batch
+    batch_input = {
+        'x1': torch.FloatTensor(x1_norm).unsqueeze(0),
+        'x2': torch.FloatTensor(x2_norm).unsqueeze(0),
+        'y_history': torch.FloatTensor(y_hist_norm).unsqueeze(0),
+        'players': {},
+        'seq_lens': torch.LongTensor([len(input_data)])
+    }
+    
+    for p_key in player_features.keys():
+        batch_input['players'][p_key] = {
+            g_key: player_features[p_key][g_key].unsqueeze(0)
+            for g_key in ['g1', 'g2', 'g3', 'g4', 'g5']
+        }
+    
+    # Predict
+    with torch.no_grad():
+        predictions = model(batch_input)
+        predictions_denorm = predictions[0].numpy() * target_std + target_mean
+    
+    # Get real values
             actuals = target_data[args.target_col].values
-            
-            # Calculate metrics
+    
+    # Calculate metrics
             min_len = min(len(actuals), len(predictions_denorm))
             rmse = np.sqrt(np.mean((actuals[:min_len] - predictions_denorm[:min_len]) ** 2))
             mae = np.mean(np.abs(actuals[:min_len] - predictions_denorm[:min_len]))
-            
-            all_rmses.append(rmse)
-            all_maes.append(mae)
+    
+    all_rmses.append(rmse)
+    all_maes.append(mae)
         
     except Exception as e:
         print(f"  ⚠ Error processing game {match_id}: {e}")
@@ -395,20 +592,20 @@ total_games = len(all_rmses)
 print(f"\nTotal test games analyzed: {total_games}")
 print(f"\nRMSE Thresholds:")
 if total_games > 0:
-    print(f"  RMSE < 1,000 gold:  {count_under_1000:4d} games ({count_under_1000/total_games*100:5.1f}%)")
-    print(f"  RMSE < 2,000 gold:  {count_under_2000:4d} games ({count_under_2000/total_games*100:5.1f}%)")
-    print(f"  RMSE < 3,000 gold:  {count_under_3000:4d} games ({count_under_3000/total_games*100:5.1f}%)")
-    print(f"  RMSE > 3,000 gold:  {count_over_3000:4d} games ({count_over_3000/total_games*100:5.1f}%)")
-    print(f"  RMSE > 5,000 gold:  {count_over_5000:4d} games ({count_over_5000/total_games*100:5.1f}%)")
+print(f"  RMSE < 1,000 gold:  {count_under_1000:4d} games ({count_under_1000/total_games*100:5.1f}%)")
+print(f"  RMSE < 2,000 gold:  {count_under_2000:4d} games ({count_under_2000/total_games*100:5.1f}%)")
+print(f"  RMSE < 3,000 gold:  {count_under_3000:4d} games ({count_under_3000/total_games*100:5.1f}%)")
+print(f"  RMSE > 3,000 gold:  {count_over_3000:4d} games ({count_over_3000/total_games*100:5.1f}%)")
+print(f"  RMSE > 5,000 gold:  {count_over_5000:4d} games ({count_over_5000/total_games*100:5.1f}%)")
 
-    print(f"\nDetailed Statistics:")
-    print(f"  Mean RMSE:   {np.mean(all_rmses):8.2f} gold")
-    print(f"  Median RMSE: {np.median(all_rmses):8.2f} gold")
-    print(f"  Std Dev:     {np.std(all_rmses):8.2f} gold")
-    print(f"  Min RMSE:    {np.min(all_rmses):8.2f} gold")
-    print(f"  Max RMSE:    {np.max(all_rmses):8.2f} gold")
-    print(f"  25th %ile:   {np.percentile(all_rmses, 25):8.2f} gold")
-    print(f"  75th %ile:   {np.percentile(all_rmses, 75):8.2f} gold")
+print(f"\nDetailed Statistics:")
+print(f"  Mean RMSE:   {np.mean(all_rmses):8.2f} gold")
+print(f"  Median RMSE: {np.median(all_rmses):8.2f} gold")
+print(f"  Std Dev:     {np.std(all_rmses):8.2f} gold")
+print(f"  Min RMSE:    {np.min(all_rmses):8.2f} gold")
+print(f"  Max RMSE:    {np.max(all_rmses):8.2f} gold")
+print(f"  25th %ile:   {np.percentile(all_rmses, 25):8.2f} gold")
+print(f"  75th %ile:   {np.percentile(all_rmses, 75):8.2f} gold")
 
 # Create histogram
 print(f"\nCreating RMSE distribution plot...")
@@ -419,7 +616,7 @@ ax1 = axes[0]
 if len(all_rmses) > 0:
     max_rmse = all_rmses.max()
     bins = np.arange(0, min(15000, max_rmse + 500), 500)
-    counts, edges, patches = ax1.hist(all_rmses, bins=bins, edgecolor='black', alpha=0.7, color='steelblue')
+counts, edges, patches = ax1.hist(all_rmses, bins=bins, edgecolor='black', alpha=0.7, color='steelblue')
 else:
     # Empty histogram if no data
     ax1.text(0.5, 0.5, 'No data to display', ha='center', va='center', transform=ax1.transAxes)

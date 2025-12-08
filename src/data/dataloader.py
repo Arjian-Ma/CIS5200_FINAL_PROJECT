@@ -32,7 +32,9 @@ class LoLSequenceDataset(Dataset):
         feature_cols: List[str] = None,
         scaler: Optional[StandardScaler] = None,
         fit_scaler: bool = True,
-        remove_leakage: bool = True
+        remove_leakage: bool = True,
+        forecast_horizon: int = 1,
+        autoregressive: bool = False
     ):
         """
         Initialize the LoL Sequence Dataset
@@ -53,6 +55,8 @@ class LoLSequenceDataset(Dataset):
         self.scaler = scaler
         self.fit_scaler = fit_scaler
         self.remove_leakage = remove_leakage
+        self.forecast_horizon = forecast_horizon
+        self.autoregressive = autoregressive
         
         # Remove data leakage features if requested
         if self.remove_leakage:
@@ -122,20 +126,57 @@ class LoLSequenceDataset(Dataset):
         for match_id in self.data['match_id'].unique():
             match_data = self.data[self.data['match_id'] == match_id].sort_values('frame_idx')
             
-            if len(match_data) < self.sequence_length:
-                logger.warning(f"Match {match_id} has only {len(match_data)} frames, skipping")
+            # Need at least sequence_length + forecast_horizon frames for autoregressive mode
+            min_frames = self.sequence_length + self.forecast_horizon if self.autoregressive else self.sequence_length
+            
+            if len(match_data) < min_frames:
+                logger.warning(f"Match {match_id} has only {len(match_data)} frames, need {min_frames}, skipping")
                 continue
             
             # Create overlapping sequences within the match
-            for i in range(len(match_data) - self.sequence_length + 1):
+            # For autoregressive: need to leave room for future targets
+            max_start = len(match_data) - self.sequence_length - self.forecast_horizon + 1 if self.autoregressive else len(match_data) - self.sequence_length + 1
+            
+            for i in range(max_start):
                 seq = match_data.iloc[i:i + self.sequence_length]
                 
-                # Features
-                X = seq[self.feature_cols].values
+                # Features: X features (and optionally Y history for autoregressive)
+                if self.autoregressive:
+                    # Add Y history to input features
+                    y_history = seq[self.target_cols].values  # Shape: (sequence_length, num_targets)
+                    X_features = seq[self.feature_cols].values  # Shape: (sequence_length, num_features)
+                    
+                    # Concatenate X features and Y history
+                    # Y history is added as additional features at each timestep
+                    X = np.concatenate([X_features, y_history], axis=1)  # Shape: (sequence_length, num_features + num_targets)
+                else:
+                    # Standard mode: only X features
+                    X = seq[self.feature_cols].values
+                
                 sequences.append(X)
                 
-                # Targets (use last timestep of sequence)
-                y = seq[self.target_cols].iloc[-1].values
+                # Targets
+                if self.autoregressive and self.forecast_horizon > 1:
+                    # Multi-step targets: predict forecast_horizon steps ahead
+                    # Start from frame after sequence ends
+                    target_start = i + self.sequence_length
+                    target_end = target_start + self.forecast_horizon
+                    future_seq = match_data.iloc[target_start:target_end]
+                    
+                    # Get targets for all future steps
+                    y = future_seq[self.target_cols].values  # Shape: (forecast_horizon, num_targets)
+                    # Flatten to (forecast_horizon * num_targets) for single target column
+                    # Or keep as (forecast_horizon, 1) if single target
+                    if len(self.target_cols) == 1:
+                        y = y.flatten()  # Shape: (forecast_horizon,)
+                    else:
+                        y = y.flatten()  # Shape: (forecast_horizon * num_targets,)
+                else:
+                    # Single-step prediction: use last timestep of sequence
+                    y = seq[self.target_cols].iloc[-1].values  # Shape: (num_targets,)
+                    if len(y.shape) == 0:
+                        y = y.reshape(1)  # Ensure it's 1D
+                
                 targets.append(y)
                 
                 # Store metadata
@@ -322,6 +363,8 @@ def create_dataloaders(
     target_cols: List[str] = None,
     num_workers: int = 4,
     pin_memory: bool = True,
+    forecast_horizon: int = 1,
+    autoregressive: bool = False,
     **kwargs
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
@@ -381,6 +424,8 @@ def create_dataloaders(
             sequence_length=sequence_length,
             target_cols=target_cols,
             fit_scaler=True,
+            forecast_horizon=forecast_horizon,
+            autoregressive=autoregressive,
             **kwargs
         )
         
@@ -391,6 +436,8 @@ def create_dataloaders(
             target_cols=target_cols,
             scaler=train_dataset.scaler,
             fit_scaler=False,
+            forecast_horizon=forecast_horizon,
+            autoregressive=autoregressive,
             **kwargs
         )
         
@@ -400,6 +447,8 @@ def create_dataloaders(
             target_cols=target_cols,
             scaler=train_dataset.scaler,
             fit_scaler=False,
+            forecast_horizon=forecast_horizon,
+            autoregressive=autoregressive,
             **kwargs
         )
     

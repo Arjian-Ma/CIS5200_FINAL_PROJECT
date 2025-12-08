@@ -245,7 +245,7 @@ def add_player_scores(input_csv_path, output_csv_path=None):
     if input_csv_path.lower().endswith('.parquet'):
         df = pd.read_parquet(input_csv_path)
     else:
-    df = pd.read_csv(input_csv_path)
+        df = pd.read_csv(input_csv_path)
     
     print(f"Original shape: {df.shape}")
     
@@ -270,14 +270,26 @@ def add_player_scores(input_csv_path, output_csv_path=None):
     # Drop individual player stats columns (keep only scores)
     print("\\nRemoving individual player stat columns (keeping only scores)...")
     
+    # Preserve identifiers and match-level labels before dropping raw stats
+    identifier_cols = ['match_id', 'frame_idx', 'timestamp']
+    label_cols = []
+    if 'Y_won' in df.columns:
+        df['match_win_label'] = df['match_id'].map(
+            df.groupby('match_id')['Y_won'].first()
+        )
+        label_cols.append('match_win_label')
+
     # Identify columns to drop (all Player stats except scores)
     player_stat_cols_to_drop = []
     for player_id in range(1, 11):
         prefix = f'Player{player_id}_'
-        # Drop all player columns except the score columns
         for col in df.columns:
             if col.startswith(prefix) and not col.endswith('_Score'):
                 player_stat_cols_to_drop.append(col)
+
+    # Ensure essential identifier/label columns are retained
+    preserve_cols = identifier_cols + label_cols
+    player_stat_cols_to_drop = [col for col in player_stat_cols_to_drop if col not in preserve_cols]
     
     # Calculate spatial dynamic features BEFORE dropping position columns
     # Check if spatial features already exist (from data_featuring.py)
@@ -316,12 +328,14 @@ def add_player_scores(input_csv_path, output_csv_path=None):
     # Calculate team scores (sum of 5 players per team)
     print("\\n=== Calculating Team Scores ===")
     
-    # Blue team (Players 1-5)
+    # Blue team (Players 1-5) - CONSISTENT with build_xy_dataframe.py team mapping
+    # Participants 1-5 = Blue team (team=1, Riot's team ID 100)
     blue_offensive = sum(df[f'Player{i}_Offensive_Score'] for i in range(1, 6))
     blue_defensive = sum(df[f'Player{i}_Defensive_Score'] for i in range(1, 6))
     blue_overall = sum(df[f'Player{i}_Overall_Score'] for i in range(1, 6))
     
-    # Red team (Players 6-10)
+    # Red team (Players 6-10) - CONSISTENT with build_xy_dataframe.py team mapping
+    # Participants 6-10 = Red team (team=-1, Riot's team ID 200)
     red_offensive = sum(df[f'Player{i}_Offensive_Score'] for i in range(6, 11))
     red_defensive = sum(df[f'Player{i}_Defensive_Score'] for i in range(6, 11))
     red_overall = sum(df[f'Player{i}_Overall_Score'] for i in range(6, 11))
@@ -377,8 +391,8 @@ def add_player_scores(input_csv_path, output_csv_path=None):
         if output_csv_path.lower().endswith('.parquet'):
             df.to_parquet(output_csv_path, index=False)
         else:
-        df.to_csv(output_csv_path, index=False)
-        print(f"✅ Successfully saved {len(df)} rows to {output_csv_path}")
+            df.to_csv(output_csv_path, index=False)
+            print(f"✅ Successfully saved {len(df)} rows to {output_csv_path}")
     
     return df
 
