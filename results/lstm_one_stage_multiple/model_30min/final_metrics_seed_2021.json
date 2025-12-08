@@ -1,0 +1,16 @@
+{
+  "encoder_length": 30,
+  "seed": 2021,
+  "train_accuracy": 0.8828125,
+  "val_accuracy": 0.8425468904244817,
+  "test_accuracy": 0.8509591736350222,
+  "test_precision": 0.8694331983805668,
+  "test_recall": 0.8315585672797676,
+  "test_f1_score": 0.8500742206828302,
+  "train_samples": 9431,
+  "val_samples": 2026,
+  "test_samples": 2033,
+  "train_matches": 9431,
+  "val_matches": 2026,
+  "test_matches": 2033
+}

@@ -1,0 +1,10 @@
+{
+  "rmse_xp_diff_scaled": 0.8325673324420647,
+  "rmse_xp_diff_raw": 4390.09449105686,
+  "velocity_mae": 0.2684252060210959,
+  "directional_accuracy": 0.5496859264329587,
+  "pearson_correlation": 0.23388960388548624,
+  "shape_loss": 0.06432529633469444,
+  "direction_loss": 0.6891131750735229,
+  "soft_dtw": 5.464276217000147
+}

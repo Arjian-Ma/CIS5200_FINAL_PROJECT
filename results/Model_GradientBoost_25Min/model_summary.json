@@ -1,0 +1,14 @@
+{
+  "model": "Gradient Boosting Classifier",
+  "n_estimators": 200,
+  "learning_rate": 0.1,
+  "max_depth": 5,
+  "features": "Gold differences (actual 0-14, Seq2Seq forecast 15-24)",
+  "target": "Win/Loss",
+  "train_accuracy": 0.8862313780260708,
+  "train_auc": 0.9579006664427977,
+  "test_accuracy": 0.6807228915662651,
+  "test_auc": 0.7422321631271542,
+  "train_samples": 17184,
+  "test_samples": 2158
+}

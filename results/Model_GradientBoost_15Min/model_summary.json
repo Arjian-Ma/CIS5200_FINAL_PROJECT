@@ -1,0 +1,14 @@
+{
+  "model": "Gradient Boosting Classifier",
+  "n_estimators": 200,
+  "learning_rate": 0.1,
+  "max_depth": 5,
+  "features": "Total_Gold_Difference and Total_Xp_Difference from frames 0-14",
+  "target": "Win/Loss (Binary Classification)",
+  "train_accuracy": 0.9156602050137014,
+  "train_auc": 0.9742885830768527,
+  "val_accuracy": 0.7295120795831359,
+  "val_auc": 0.8105746610397775,
+  "test_accuracy": 0.7348484848484849,
+  "test_auc": 0.8188028966236006
+}

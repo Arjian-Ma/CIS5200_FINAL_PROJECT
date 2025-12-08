@@ -1,0 +1,16 @@
+{
+  "encoder_length": 15,
+  "seed": 1415,
+  "train_accuracy": 0.7677899096385542,
+  "val_accuracy": 0.7609405617243632,
+  "test_accuracy": 0.761239633347883,
+  "test_precision": 0.7658495350803043,
+  "test_recall": 0.7704081632653061,
+  "test_f1_score": 0.768122085629504,
+  "train_samples": 21356,
+  "val_samples": 4593,
+  "test_samples": 4582,
+  "train_matches": 21356,
+  "val_matches": 4593,
+  "test_matches": 4582
+}

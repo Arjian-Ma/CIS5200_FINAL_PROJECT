@@ -1,0 +1,10 @@
+{
+  "rmse_gold_diff_scaled": 0.48546170855601956,
+  "rmse_gold_diff_raw": 1994.026200374816,
+  "velocity_mae": 0.2186110387068557,
+  "directional_accuracy": 0.5777734676657766,
+  "pearson_correlation": 0.22926911908072542,
+  "shape_loss": 0.040866654583009476,
+  "direction_loss": 0.6861181528740284,
+  "soft_dtw": 0.7419346588540207
+}
