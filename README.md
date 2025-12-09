@@ -1,4 +1,4 @@
-# ESE5380 Final Project - Directory Structure
+# CIS5200 Final Project - Directory Structure
 
 ## Overview
 This project implements a comprehensive machine learning pipeline for analyzing League of Legends match data using various models (RNN, LSTM, Transformer, Diffusion) and traditional ML approaches.
