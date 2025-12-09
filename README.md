@@ -6,7 +6,7 @@ This project implements a comprehensive machine learning pipeline for analyzing 
 ## Directory Structure
 
 ```
-ESE5380_FINAL/
+CIS5200_FINAL/
 ├── 📁 configs/                    # Configuration files
 ├── 📁 data/                      # Data storage (organized by processing stage)
 │   ├── 📁 raw/                   # Original/raw data files
